@@ -235,12 +235,9 @@ async def create_chat_completion(
     
     # 流式输出
     if request.stream:
+        generator = linkai_stream_generator(linkai_body, request.model or "unknown")
         return StreamingResponse(
-            LinkAIStreamingResponse(
-                linkai_body=linkai_body,
-                api_key=LOCAL_API_KEY,
-                model_id=request.model or "unknown"
-            ),
+            StreamingResponseWrapper(generator),
             media_type="text/event-stream"
         )
     
@@ -292,8 +289,95 @@ async def create_chat_completion(
         }
 
 
+class StreamingResponseWrapper:
+    """包装异步生成器为可迭代对象"""
+    
+    def __init__(self, generator):
+        self._generator = generator
+    
+    def __aiter__(self):
+        return self._generator
+    
+    async def __anext__(self):
+        try:
+            return await self._generator.__anext__()
+        except StopAsyncIteration:
+            raise StopAsyncIteration
+
+
+async def linkai_stream_generator(linkai_body: dict, model_id: str):
+    """异步生成器用于流式响应"""
+    linkai_body["stream"] = True
+    async with httpx.AsyncClient() as client:
+        async with client.stream(
+            "POST",
+            f"{LINKAI_BASE_URL}/chat/completions",
+            json=linkai_body,
+            headers={"Authorization": f"Bearer {LINKAI_API_KEY}"},
+            timeout=120.0
+        ) as response:
+            
+            if response.status_code != 200:
+                error_msg = "LinkAI API Error"
+                try:
+                    error_data = await response.json()
+                    error_msg = error_data.get("error", {}).get("message", error_msg)
+                except:
+                    pass
+                
+                yield f'data: ' + json.dumps({"error": {"message": error_msg}}) + '\n\n'
+                yield "data: [DONE]\n\n"
+                return
+            
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    data = line[6:]
+                    if data == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        break
+                    
+                    try:
+                        linkai_data = json.loads(data)
+                        
+                        # 转换为 OpenAI 格式
+                        choices = linkai_data.get("choices", [])
+                        openai_choices = []
+                        
+                        for i, choice in enumerate(choices):
+                            delta = choice.get("delta", {})
+                            finish_reason = choice.get("finish_reason")
+                            
+                            openai_choices.append({
+                                "index": i,
+                                "delta": {"content": delta.get("content", "")},
+                                "finish_reason": finish_reason
+                            })
+                        
+                        openai_data = {
+                            "id": f"chatcmpl-{secrets.token_hex(8)}",
+                            "object": "chat.completion.chunk",
+                            "created": int(__import__("time").time()),
+                            "model": model_id,
+                            "choices": openai_choices
+                        }
+                        
+                        # 如果有 usage 信息（在最后一个 chunk）
+                        usage = linkai_data.get("usage") or choice.get("usage", {})
+                        if usage and finish_reason:
+                            openai_data["usage"] = {
+                                "prompt_tokens": usage.get("prompt_tokens", 0),
+                                "completion_tokens": usage.get("completion_tokens", 0),
+                                "total_tokens": usage.get("total_tokens", 0)
+                            }
+                        
+                        yield f"data: {json.dumps(openai_data)}\n\n"
+                        
+                    except json.JSONDecodeError:
+                        continue
+
+
 class LinkAIStreamingResponse:
-    """流式响应"""
+    """流式响应（兼容旧版本）- 已废弃，使用 linkai_stream_generator"""
     
     def __init__(self, linkai_body: dict, api_key: str, model_id: str = "unknown"):
         self.linkai_body = linkai_body
@@ -302,72 +386,8 @@ class LinkAIStreamingResponse:
         self.model_id = model_id
     
     async def __call__(self, request: Request):
-        async with httpx.AsyncClient() as client:
-            async with client.stream(
-                "POST",
-                f"{LINKAI_BASE_URL}/chat/completions",
-                json=self.linkai_body,
-                headers={"Authorization": f"Bearer {LINKAI_API_KEY}"},
-                timeout=120.0
-            ) as response:
-                
-                if response.status_code != 200:
-                    error_msg = "LinkAI API Error"
-                    try:
-                        error_data = await response.json()
-                        error_msg = error_data.get("error", {}).get("message", error_msg)
-                    except:
-                        pass
-                    
-                    yield f'data: ' + json.dumps({"error": {"message": error_msg}}) + '\n\n'
-                    yield "data: [DONE]\n\n"
-                    return
-                
-                async for line in response.aiter_lines():
-                    if line.startswith("data: "):
-                        data = line[6:]
-                        if data == "[DONE]":
-                            yield "data: [DONE]\n\n"
-                            break
-                        
-                        try:
-                            linkai_data = json.loads(data)
-                            
-                            # 转换为 OpenAI 格式
-                            choices = linkai_data.get("choices", [])
-                            openai_choices = []
-                            
-                            for i, choice in enumerate(choices):
-                                delta = choice.get("delta", {})
-                                finish_reason = choice.get("finish_reason")
-                                
-                                openai_choices.append({
-                                    "index": i,
-                                    "delta": {"content": delta.get("content", "")},
-                                    "finish_reason": finish_reason
-                                })
-                            
-                            openai_data = {
-                                "id": f"chatcmpl-{secrets.token_hex(8)}",
-                                "object": "chat.completion.chunk",
-                                "created": int(__import__("time").time()),
-                                "model": self.model_id,
-                                "choices": openai_choices
-                            }
-                            
-                            # 如果有 usage 信息（在最后一个 chunk）
-                            usage = linkai_data.get("usage") or choice.get("usage", {})
-                            if usage and finish_reason:
-                                openai_data["usage"] = {
-                                    "prompt_tokens": usage.get("prompt_tokens", 0),
-                                    "completion_tokens": usage.get("completion_tokens", 0),
-                                    "total_tokens": usage.get("total_tokens", 0)
-                                }
-                            
-                            yield f"data: {json.dumps(openai_data)}\n\n"
-                            
-                        except json.JSONDecodeError:
-                            continue
+        async for chunk in linkai_stream_generator(self.linkai_body, self.model_id):
+            yield chunk
 
 
 @app.get("/health")
