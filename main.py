@@ -24,12 +24,59 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger("linkai_proxy")
 
 
+def to_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ===== 配置 =====
 LINKAI_API_KEY = os.getenv("LINKAI_API_KEY")
 LINKAI_BASE_URL = os.getenv("LINKAI_BASE_URL", "https://api.link-ai.tech/v1").rstrip("/")
 LOCAL_API_KEY = os.getenv("LOCAL_API_KEY")
 LOCAL_HOST = os.getenv("LOCAL_HOST", "0.0.0.0")
 LOCAL_PORT = int(os.getenv("LOCAL_PORT", "8000"))
+
+# ===== 内存路由配置 =====
+MEMORY_ROUTING_ENABLED = to_bool(os.getenv("MEMORY_ROUTING_ENABLED"), default=False)
+MEMORY_ROUTING_MIN_SCORE = int(os.getenv("MEMORY_ROUTING_MIN_SCORE", "2"))
+MEMORY_ROUTING_DEBUG = to_bool(os.getenv("MEMORY_ROUTING_DEBUG"), default=False)
+MEMORY_MANAGER_APP_CODE = os.getenv("MEMORY_MANAGER_APP_CODE", "").strip()
+MEMORY_EXTRACTOR_APP_CODE = os.getenv("MEMORY_EXTRACTOR_APP_CODE", "").strip() or MEMORY_MANAGER_APP_CODE
+
+
+MEMORY_MANAGER_STRONG = {
+    "you are a smart memory manager",
+    "add into the memory",
+    "update the memory",
+    "delete from the memory",
+    '"old_memory"',
+    "the new retrieved facts are mentioned in the triple backticks",
+}
+MEMORY_MANAGER_WEAK = {
+    "current content of my memory",
+    "must return your response in the following json structure only",
+    '"memory" : [',
+    "do not return anything except the json format",
+    '"event" : "add"',
+    '"event" : "update"',
+    '"event" : "delete"',
+    '"event" : "none"',
+}
+
+MEMORY_EXTRACTOR_STRONG = {
+    "you are a personal information organizer",
+    "output facts:",
+    "return the facts and preferences in a json format",
+    "rfc8259 compliant json response",
+}
+MEMORY_EXTRACTOR_WEAK = {
+    "types of information to remember",
+    "input conversation:",
+    "do not include markdown code blocks",
+    "detect the language of the user input",
+    '"facts" : [',
+}
 
 
 def parse_model_app_mapping() -> dict[str, str]:
@@ -116,10 +163,89 @@ def mask_secret(value: Optional[str]) -> str:
     return f"***{value[-4:]}"
 
 
+def normalize_content(content: Union[str, list]) -> str:
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+
+            item_type = str(item.get("type", "")).lower()
+            if item_type == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item.get("text"), dict):
+                # 兼容部分多模态 SDK 的 text 字段结构
+                t = item["text"].get("value")
+                if isinstance(t, str):
+                    parts.append(t)
+        return "\n".join(parts)
+
+    return ""
+
+
+def memory_route_decision(messages: list["Message"]) -> tuple[Optional[str], str]:
+    if not MEMORY_ROUTING_ENABLED:
+        return None, "default"
+
+    corpus_parts: list[str] = []
+    for msg in messages:
+        if msg.role in {"system", "user"}:
+            corpus_parts.append(normalize_content(msg.content))
+
+    corpus = "\n".join(corpus_parts).lower()
+
+    manager_strong = any(k in corpus for k in MEMORY_MANAGER_STRONG)
+    manager_score = sum(1 for k in MEMORY_MANAGER_WEAK if k in corpus)
+    manager_hit = manager_strong or manager_score >= MEMORY_ROUTING_MIN_SCORE
+
+    extractor_strong = any(k in corpus for k in MEMORY_EXTRACTOR_STRONG)
+    extractor_score = sum(1 for k in MEMORY_EXTRACTOR_WEAK if k in corpus)
+    extractor_hit = extractor_strong or extractor_score >= MEMORY_ROUTING_MIN_SCORE
+
+    if MEMORY_ROUTING_DEBUG:
+        logger.info(
+            "[RouteDetect] manager_hit=%s (strong=%s score=%d) extractor_hit=%s (strong=%s score=%d)",
+            manager_hit,
+            manager_strong,
+            manager_score,
+            extractor_hit,
+            extractor_strong,
+            extractor_score,
+        )
+
+    if manager_hit and MEMORY_MANAGER_APP_CODE:
+        return MEMORY_MANAGER_APP_CODE, "memory_manager"
+
+    if extractor_hit and MEMORY_EXTRACTOR_APP_CODE:
+        return MEMORY_EXTRACTOR_APP_CODE, "memory_extractor"
+
+    # 命中但未配置专用 app code 时回退默认路由
+    if manager_hit:
+        return None, "memory_manager_fallback"
+    if extractor_hit:
+        return None, "memory_extractor_fallback"
+
+    return None, "default"
+
+
 logger.info("[LinkAI Proxy] Model mapping count: %d", len(MODEL_APP_MAPPINGS))
 logger.info("[LinkAI Proxy] AppCode API key count: %d", len(APP_CODE_API_KEYS))
 logger.info("[LinkAI Proxy] Default APP Code set: %s", "yes" if DEFAULT_APP_CODE else "no")
 logger.info("[LinkAI Proxy] Global LinkAI API key: %s", mask_secret(LINKAI_API_KEY))
+logger.info("[LinkAI Proxy] Memory routing enabled: %s", MEMORY_ROUTING_ENABLED)
+logger.info(
+    "[LinkAI Proxy] Memory route app codes set: manager=%s extractor=%s",
+    "yes" if bool(MEMORY_MANAGER_APP_CODE) else "no",
+    "yes" if bool(MEMORY_EXTRACTOR_APP_CODE) else "no",
+)
 
 
 def get_app_code_for_model(model_id: Optional[str]) -> str:
@@ -203,7 +329,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="LinkAI OpenAI Compatible API",
     description="将 Link-AI API 包装成 OpenAI 兼容格式，支持多模型映射",
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
@@ -389,14 +515,16 @@ async def create_chat_completion(
     request: ChatRequest,
     _: str = Depends(verify_api_key),
 ):
-    app_code = get_app_code_for_model(request.model)
+    route_app_code, route_tag = memory_route_decision(request.messages)
+
+    app_code = route_app_code or get_app_code_for_model(request.model)
     if not app_code:
         raise HTTPException(
             status_code=400,
             detail=f"Model '{request.model}' not found in mappings and no default APP Code configured",
         )
 
-    logger.info("[LinkAI Proxy] Model '%s' -> APP Code '%s'", request.model, app_code)
+    logger.info("[LinkAI Proxy] route=%s model='%s' -> app_code='%s'", route_tag, request.model, app_code)
 
     linkai_body = build_linkai_body(request, app_code)
     client = http_client()
@@ -467,8 +595,9 @@ async def create_chat_completion(
 async def health_check():
     return {
         "status": "ok",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "mappings_count": len(MODEL_APP_MAPPINGS),
+        "memory_routing_enabled": MEMORY_ROUTING_ENABLED,
     }
 
 
@@ -476,7 +605,7 @@ async def health_check():
 async def root():
     return {
         "name": "LinkAI OpenAI Compatible API",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "description": "支持多模型多 APP Code 映射",
         "endpoints": {
             "chat_completions": "POST /v1/chat/completions",
@@ -486,6 +615,7 @@ async def root():
         "model_mappings": MODEL_APP_MAPPINGS,
         "app_code_api_keys": {k: "***" for k in APP_CODE_API_KEYS.keys()},
         "default_app_code": DEFAULT_APP_CODE,
+        "memory_routing_enabled": MEMORY_ROUTING_ENABLED,
     }
 
 
