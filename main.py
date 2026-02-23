@@ -57,11 +57,39 @@ def parse_model_app_mapping() -> Dict[str, str]:
 
 MODEL_APP_MAPPINGS = parse_model_app_mapping()
 
+# ===== APP Code 到 API Key 映射配置 =====
+def parse_app_code_api_keys() -> Dict[str, str]:
+    """
+    解析环境变量中的 APP Code → API Key 映射
+    格式: APP_CODE_KEYS=CM5Ex4OE:key1,jPzuwqKZ:key2
+    或者单独的变量: APP_CODE_CM5Ex4OE=key1, APP_CODE_jPzuwqKZ=key2
+    """
+    key_mappings = {}
+    
+    # 方式1: 解析 APP_CODE_KEYS (逗号分隔的 app_code:api_key 对)
+    app_code_keys = os.getenv("APP_CODE_KEYS", "")
+    if app_code_keys:
+        for pair in app_code_keys.split(","):
+            if ":" in pair:
+                app_code, api_key = pair.split(":", 1)
+                key_mappings[app_code.strip()] = api_key.strip()
+    
+    # 方式2: 解析单独的 APP_CODE_<app_code>=<api_key> 变量
+    for key, value in os.environ.items():
+        if key.startswith("APP_CODE_") and key != "APP_CODE_KEYS":
+            app_code = key[9:]  # 去掉 "APP_CODE_" 前缀
+            key_mappings[app_code] = value
+    
+    return key_mappings
+
+APP_CODE_API_KEYS = parse_app_code_api_keys()
+
 # 默认 APP Code (如果没有匹配到模型映射)
 DEFAULT_APP_CODE = os.getenv("LINKAI_APP_CODE", "")
 
 # ===== 调试信息 =====
 print(f"[LinkAI Proxy] Model→AppCode mappings: {MODEL_APP_MAPPINGS}")
+print(f"[LinkAI Proxy] AppCode→API Key mappings: {APP_CODE_API_KEYS}")
 print(f"[LinkAI Proxy] Default APP Code: {DEFAULT_APP_CODE}")
 
 
@@ -94,6 +122,16 @@ def get_app_code_for_model(model_id: Optional[str]) -> str:
     
     # 没有匹配到，返回默认
     return DEFAULT_APP_CODE
+
+
+def get_api_key_for_app_code(app_code: str) -> str:
+    """
+    根据 APP Code 获取对应的 API Key
+    优先使用专用的 APP Code API Key，其次使用全局 LINKAI_API_KEY
+    """
+    if app_code in APP_CODE_API_KEYS:
+        return APP_CODE_API_KEYS[app_code]
+    return LINKAI_API_KEY
 
 
 # ===== 鉴权 =====
@@ -209,6 +247,9 @@ async def create_chat_completion(
             detail=f"Model '{request.model}' not found in mappings and no default APP Code configured"
         )
     
+    # 根据 APP Code 获取对应的 API Key
+    linkai_api_key = get_api_key_for_app_code(app_code)
+    
     print(f"[LinkAI Proxy] Model: {request.model} → APP Code: {app_code}")
     
     # 构建 Link-AI 请求（支持多模态消息）
@@ -235,7 +276,7 @@ async def create_chat_completion(
     
     # 流式输出
     if request.stream:
-        generator = linkai_stream_generator(linkai_body, request.model or "unknown")
+        generator = linkai_stream_generator(linkai_body, request.model or "unknown", app_code)
         return StreamingResponse(
             StreamingResponseWrapper(generator),
             media_type="text/event-stream"
@@ -246,7 +287,7 @@ async def create_chat_completion(
         response = await client.post(
             f"{LINKAI_BASE_URL}/chat/completions",
             json=linkai_body,
-            headers={"Authorization": f"Bearer {LINKAI_API_KEY}"},
+            headers={"Authorization": f"Bearer {linkai_api_key}"},
             timeout=60.0
         )
         
@@ -305,15 +346,16 @@ class StreamingResponseWrapper:
             raise StopAsyncIteration
 
 
-async def linkai_stream_generator(linkai_body: dict, model_id: str):
+async def linkai_stream_generator(linkai_body: dict, model_id: str, app_code: str):
     """异步生成器用于流式响应"""
     linkai_body["stream"] = True
+    linkai_api_key = get_api_key_for_app_code(app_code)
     async with httpx.AsyncClient() as client:
         async with client.stream(
             "POST",
             f"{LINKAI_BASE_URL}/chat/completions",
             json=linkai_body,
-            headers={"Authorization": f"Bearer {LINKAI_API_KEY}"},
+            headers={"Authorization": f"Bearer {linkai_api_key}"},
             timeout=120.0
         ) as response:
             
@@ -413,6 +455,7 @@ async def root():
             "health": "GET /health"
         },
         "model_mappings": MODEL_APP_MAPPINGS,
+        "app_code_api_keys": {k: "***" for k in APP_CODE_API_KEYS.keys()},  # 隐藏 API Key
         "default_app_code": DEFAULT_APP_CODE
     }
 
